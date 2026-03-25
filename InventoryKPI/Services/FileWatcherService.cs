@@ -27,6 +27,8 @@ namespace InventoryKPI.Services
         public Action? OnReloadComplete { get; set; }
 
         private const string ProcessedFilesPath = "processed_files.json";
+        private const int MaxRetries = 3;
+        private const int RetryDelayMs = 500;
 
         public FileWatcherService(FileProcessor fileProcessor, KpiCalculator kpiCalculator,
             Action<string, string>? onLog = null)
@@ -100,42 +102,56 @@ namespace InventoryKPI.Services
 
         private async Task ProcessFileAsync(string filePath, bool isNew)
         {
-            try
+            int attempt = 0;
+            while (attempt < MaxRetries)
             {
-                if (isNew) await Task.Delay(300);
-
-                string checksum = ComputeChecksum(filePath);
-                string fileKey = Path.GetFileName(filePath) + "_" + checksum;
-
-                if (isNew)
+                try
                 {
-                    if (_processedFiles.ContainsKey(fileKey))
+                    if (isNew) await Task.Delay(300);
+
+                    string checksum = ComputeChecksum(filePath);
+                    string fileKey = Path.GetFileName(filePath) + "_" + checksum;
+
+                    if (isNew)
                     {
-                        Console.WriteLine($"[SKIP] Duplicate: {Path.GetFileName(filePath)}");
+                        if (_processedFiles.ContainsKey(fileKey))
+                        {
+                            Console.WriteLine($"[SKIP] Duplicate: {Path.GetFileName(filePath)}");
+                            return;
+                        }
+                        _processedFiles[fileKey] = DateTime.Now.ToString("o");
+                        SaveProcessedFiles();
+                    }
+
+                    var invoices = await _fileProcessor.ReadInvoiceFileAsync(filePath);
+
+                    if (invoices.Count == 0)
+                    {
+                        if (!isNew) UpdateProgress(warn: true);
+                        else Console.WriteLine($"[WARN] No valid invoices in: {Path.GetFileName(filePath)}");
                         return;
                     }
-                    _processedFiles[fileKey] = DateTime.Now.ToString("o");
-                    SaveProcessedFiles();
+
+                    _kpiCalculator.AddInvoices(invoices);
+
+                    if (!isNew) UpdateProgress();
+                    else Console.WriteLine($"[OK] Loaded: {Path.GetFileName(filePath)} — {invoices.Count} invoices");
+                    return; // success
                 }
-
-                var invoices = await _fileProcessor.ReadInvoiceFileAsync(filePath);
-
-                if (invoices.Count == 0)
+                catch (Exception ex)
                 {
-                    if (!isNew) UpdateProgress(warn: true);
-                    else Console.WriteLine($"[WARN] No valid invoices in: {Path.GetFileName(filePath)}");
-                    return;
+                    attempt++;
+                    if (attempt < MaxRetries)
+                    {
+                        Console.WriteLine($"[RETRY {attempt}/{MaxRetries}] {Path.GetFileName(filePath)}: {ex.Message}");
+                        await Task.Delay(RetryDelayMs * attempt);
+                    }
+                    else
+                    {
+                        if (!isNew) UpdateProgress(error: true);
+                        else Console.WriteLine($"[ERROR] Failed after {MaxRetries} attempts: {Path.GetFileName(filePath)}: {ex.Message}");
+                    }
                 }
-
-                _kpiCalculator.AddInvoices(invoices);
-
-                if (!isNew) UpdateProgress();
-                else Console.WriteLine($"[OK] Loaded: {Path.GetFileName(filePath)} — {invoices.Count} invoices");
-            }
-            catch (Exception ex)
-            {
-                if (!isNew) UpdateProgress(error: true);
-                else Console.WriteLine($"[ERROR] Failed: {Path.GetFileName(filePath)}: {ex.Message}");
             }
         }
 

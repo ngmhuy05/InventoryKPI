@@ -14,6 +14,9 @@ namespace InventoryKPI.Services
         private DateTime _minSaleDate = DateTime.MaxValue;
         private DateTime _maxSaleDate = DateTime.MinValue;
 
+        // FIX KPI 5: dùng max invoice date thay vì DateTime.Now để kết quả reproducible
+        private DateTime _maxInvoiceDate = DateTime.MinValue;
+
         private readonly object _lock = new();
 
         public void AddInvoices(List<Invoice> invoices)
@@ -25,6 +28,9 @@ namespace InventoryKPI.Services
                     DateTime invoiceDate = DateTime.Now;
                     if (!string.IsNullOrEmpty(invoice.DateString))
                         DateTime.TryParse(invoice.DateString, out invoiceDate);
+
+                    // FIX KPI 5: track max invoice date across all invoices
+                    if (invoiceDate > _maxInvoiceDate) _maxInvoiceDate = invoiceDate;
 
                     foreach (var line in invoice.LineItems)
                     {
@@ -110,9 +116,9 @@ namespace InventoryKPI.Services
                 decimal avgDailySales = totalQtySold / salesDays;
 
                 // --- KPI 5: Average Inventory Age ---
-                // FIX: simple average per SKU (earliest purchase date of unsold SKUs)
-                // đúng công thức: Average(Current Date − Purchase Date of Unsold Items)
-                DateTime today = DateTime.Now;
+                // FIX: dùng max invoice date trong dataset thay vì DateTime.Now
+                // → kết quả reproducible, không thay đổi theo ngày chạy
+                DateTime today = _maxInvoiceDate != DateTime.MinValue ? _maxInvoiceDate : DateTime.Now;
                 var ages = new List<double>();
 
                 foreach (var key in allKeys)
@@ -141,6 +147,52 @@ namespace InventoryKPI.Services
             }
         }
 
+        // --- BONUS: Top 10 Out-of-Stock SKUs (balance <= 0, sorted by most oversold) ---
+        public List<(string Key, decimal Purchased, decimal Sold, decimal Balance)> GetTopOutOfStock(int top = 10)
+        {
+            lock (_lock)
+            {
+                var allKeys = _totalPurchased.Keys.Union(_totalSold.Keys);
+                return allKeys
+                    .Select(key =>
+                    {
+                        decimal purchased = _totalPurchased.GetValueOrDefault(key, 0);
+                        decimal sold = _totalSold.GetValueOrDefault(key, 0);
+                        return (key, purchased, sold, purchased - sold);
+                    })
+                    .Where(x => x.Item4 <= 0)
+                    .OrderBy(x => x.Item4)
+                    .Take(top)
+                    .ToList();
+            }
+        }
+
+        // --- BONUS: Top 10 SKUs by inventory value ---
+        public List<(string Key, decimal Unsold, decimal AvgCost, decimal Value)> GetTopHighestValue(int top = 10)
+        {
+            lock (_lock)
+            {
+                var allKeys = _totalPurchased.Keys.Union(_totalSold.Keys);
+                return allKeys
+                    .Select(key =>
+                    {
+                        decimal purchased = _totalPurchased.GetValueOrDefault(key, 0);
+                        decimal sold = _totalSold.GetValueOrDefault(key, 0);
+                        decimal unsold = purchased - sold;
+
+                        decimal avgCost = 0;
+                        if (unsold > 0 && _purchaseCostData.TryGetValue(key, out var costData) && costData.TotalQty > 0)
+                            avgCost = costData.TotalCost / costData.TotalQty;
+
+                        return (key, unsold, avgCost, unsold * avgCost);
+                    })
+                    .Where(x => x.Item4 > 0)
+                    .OrderByDescending(x => x.Item4)
+                    .Take(top)
+                    .ToList();
+            }
+        }
+
         public void Reset()
         {
             lock (_lock)
@@ -152,6 +204,8 @@ namespace InventoryKPI.Services
                 // FIX KPI 4: reset min/max date
                 _minSaleDate = DateTime.MaxValue;
                 _maxSaleDate = DateTime.MinValue;
+                // FIX KPI 5: reset max invoice date
+                _maxInvoiceDate = DateTime.MinValue;
             }
         }
     }
